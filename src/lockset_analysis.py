@@ -41,16 +41,17 @@ KNOWN_MUTATING_METHODS = {
 
 
 class LockState(object):
-    __slots__ = ("depths", "targets", "reachable")
+    __slots__ = ("depths", "targets", "reachable", "unknown_context")
     # The top value denotes "at least this many acquisitions".  It keeps
     # loops and recursive calls finite without losing an outer acquisition
     # when a nested guard releases the same recursive mutex.
     DEPTH_TOP = 4
 
-    def __init__(self, depths=None, reachable=True, targets=None):
+    def __init__(self, depths=None, reachable=True, targets=None, unknown_context=False):
         self.depths = dict(depths or {})
         self.targets = {key: set(values) for key, values in (targets or {}).items()}
         self.reachable = reachable
+        self.unknown_context = unknown_context
 
     @property
     def may(self):
@@ -61,7 +62,7 @@ class LockState(object):
         return {name for name, (minimum, _) in self.depths.items() if minimum > 0}
 
     def copy(self):
-        return LockState(self.depths, self.reachable, self.targets)
+        return LockState(self.depths, self.reachable, self.targets, self.unknown_context)
 
     def acquire(self, names):
         for name in names:
@@ -84,7 +85,8 @@ class LockState(object):
     def key(self):
         targets = tuple(sorted((key, tuple(sorted(values)))
                                for key, values in self.targets.items() if values))
-        return (tuple(sorted(self.depths.items())), targets, self.reachable)
+        return (tuple(sorted(self.depths.items())), targets, self.reachable,
+                self.unknown_context)
 
     @staticmethod
     def merge(states):
@@ -102,7 +104,8 @@ class LockState(object):
         for state in states:
             for key, values in state.targets.items():
                 targets[key].update(values)
-        return LockState(depths, targets=targets)
+        return LockState(depths, targets=targets,
+                         unknown_context=any(state.unknown_context for state in states))
 
 
 class FunctionModel(object):
@@ -122,19 +125,30 @@ class FunctionModel(object):
         self.line = scope.bodyStart.linenr
         self.initializers = []
         self.initializer_colon = None
-        definition = self.function.tokenDef
-        parameters = definition.next if definition else None
-        if parameters and parameters.str == "(" and parameters.link:
-            after_parameters = self.index.get(parameters.link.Id, self.start) + 1
-            colon = next((pos for pos in range(after_parameters, self.start)
-                          if self.tokens[pos].str == ":"), None)
-            if colon is not None:
-                self.initializer_colon = colon
-                for pos in range(colon + 1, self.start):
-                    item = self.tokens[pos]
-                    if (item.variable and item.variable.access in ("Public", "Protected", "Private")
-                            and item.next and item.next.str in ("(", "{")):
-                        self.initializers.append(item)
+        if self.function.type == "Constructor":
+            # tokenDef can denote a declaration in an included header.  Find
+            # this body's own constructor signature, rather than scanning from
+            # that declaration through unrelated function bodies for a ':'.
+            parameters_end = None
+            for pos in range(self.start - 1, -1, -1):
+                definition = self.tokens[pos]
+                parameters = definition.next
+                if (definition.function is self.function and parameters and
+                        parameters.str == "(" and parameters.link and
+                        definition.file == scope.bodyStart.file):
+                    parameters_end = self.index.get(parameters.link.Id)
+                    if parameters_end is not None and parameters_end < self.start:
+                        break
+            if parameters_end is not None and parameters_end < self.start:
+                colon = next((pos for pos in range(parameters_end + 1, self.start)
+                              if self.tokens[pos].str == ":"), None)
+                if colon is not None:
+                    self.initializer_colon = colon
+                    for pos in range(colon + 1, self.start):
+                        item = self.tokens[pos]
+                        if (item.variable and item.variable.access in ("Public", "Protected", "Private")
+                                and item.next and item.next.str in ("(", "{")):
+                            self.initializers.append(item)
         self.deferred_assignments = defaultdict(list)
         for assignment in self.tokens[self.start + 1:self.end]:
             if not assignment.isAssignmentOp or not assignment.astOperand1:
@@ -166,6 +180,10 @@ def qualified_function_name(function):
         return "<unknown>"
     names = enclosing_named_scope(function.tokenDef.scope if function.tokenDef else None)
     name = function.name or (function.tokenDef.str if function.tokenDef else "<unknown>")
+    if function.type == "Destructor" and not name.rsplit("::", 1)[-1].startswith("~"):
+        parts = name.rsplit("::", 1)
+        parts[-1] = "~" + parts[-1]
+        name = "::".join(parts)
     if not names or name.startswith("::") or "::" in name:
         return name.strip(":")
     return "::".join(names + [name])
@@ -680,9 +698,18 @@ class LocksetAnalyzer(object):
                     if self._is_lambda_body(token):
                         lambda_returns = []
                         immediate = self._lambda_is_immediately_invoked(token)
+                        opaque_argument = (not immediate and
+                                           self._lambda_is_opaque_call_argument(model, token, state))
+                        lambda_entry = state.copy() if immediate else LockState()
+                        if opaque_argument:
+                            lambda_entry = LockState(
+                                {name: (0, maximum)
+                                 for name, (_, maximum) in state.depths.items()},
+                                unknown_context=True,
+                            )
                         lambda_out = self._analyze_block(
                             model, pos, nested_end,
-                            state.copy() if immediate else LockState(),
+                            lambda_entry,
                             local_aliases, lambda_returns, [],
                         )
                         if immediate:
@@ -812,6 +839,22 @@ class LocksetAnalyzer(object):
         call = capture.astParent if capture else None
         return bool(capture and capture.str == "[" and call and call.str == "("
                     and call.astOperand1 is capture)
+
+    def _lambda_is_opaque_call_argument(self, model, body_start, state):
+        node = body_start.astParent
+        while node:
+            callee = self._callee_token(node.link) if node.str == "(" and node.link else None
+            if callee:
+                # Explicit thread launch does not execute the body in the
+                # caller's lock-owning thread.
+                qualifier = callee.previous
+                if (callee.str in ("async", "thread", "jthread") and
+                        qualifier and qualifier.str == "::" and qualifier.previous and
+                        qualifier.previous.str == "std"):
+                    return False
+                return not self._call_candidates(model, node.link, state)
+            node = node.astParent
+        return False
 
     @staticmethod
     def _find_until(tokens, start, end, spelling):
@@ -965,6 +1008,26 @@ class LocksetAnalyzer(object):
             current = current.astParent
         return None
 
+    def _is_reference_argument_binding(self, model, token):
+        parent = token.astParent
+        while parent:
+            if parent.str == "(" and parent.link:
+                callee = self._callee_token(parent.link)
+                if callee:
+                    actuals = cppcheckdata.getArguments(callee) or []
+                    candidates = self._call_candidates(model, parent.link)
+                    for index, actual in enumerate(actuals):
+                        if actual is not token:
+                            continue
+                        return bool(candidates) and all(
+                            index < len(candidate.function.argument) and
+                            (candidate.function.argument[index + 1].isReference or
+                             "&" in variable_type(candidate.function.argument[index + 1]))
+                            for candidate in candidates
+                        )
+            parent = parent.astParent
+        return False
+
     def _memory_access(self, model, token, aliases, defer_calls=True):
         variable = token.variable
         if not variable or variable.nameToken is token:
@@ -992,6 +1055,8 @@ class LocksetAnalyzer(object):
             effect = self._member_method_effect(token)
             if effect:
                 kind, may_write = effect
+        if kind == "READ" and not may_write and self._is_reference_argument_binding(model, token):
+            return None
         assignment = self._assignment_ancestor(token)
         if defer_calls and assignment and assignment.astOperand1:
             lhs_ids = {item.Id for item in ast_variable_tokens(assignment.astOperand1)}
@@ -1021,12 +1086,16 @@ class LocksetAnalyzer(object):
                 "must_locks": set(state.must),
                 "may_write": may_write,
             }
+            if state.unknown_context:
+                self.accesses[key]["lock_context_unknown"] = True
             return
         if existing["access_kind"] != kind:
             existing["access_kind"] = "READ_WRITE"
         existing["may_locks"].update(state.may)
         existing["must_locks"].intersection_update(state.must)
         existing["may_write"] = existing["may_write"] or may_write
+        if state.unknown_context:
+            existing["lock_context_unknown"] = True
 
     @staticmethod
     def _callee_token(token):
@@ -1150,7 +1219,8 @@ class LocksetAnalyzer(object):
     def _call_entry(self, candidate, callee, caller_model, caller_state):
         shared = {key: values for key, values in caller_state.targets.items()
                   if key[0] == "shared"}
-        entry = LockState(caller_state.depths, caller_state.reachable, shared)
+        entry = LockState(caller_state.depths, caller_state.reachable, shared,
+                          caller_state.unknown_context)
         actuals = cppcheckdata.getArguments(callee) or []
         formals = [candidate.function.argument[key]
                    for key in sorted(candidate.function.argument)]
@@ -1172,6 +1242,75 @@ class LocksetAnalyzer(object):
                                if key[0] == "shared"})
         return result
 
+    def _member_call_candidates(self, model, callee, candidates):
+        member = callee.astParent
+        if not member or member.str != "." or member.astOperand2 is not callee:
+            return candidates
+        receiver = member.astOperand1
+        if not receiver:
+            return candidates
+        if receiver.str == "this":
+            receiver_type = "::".join(enclosing_named_scope(model.function.tokenDef.scope))
+        elif receiver.variable:
+            operator = self._original_member_operator(member)
+            if operator not in (".", "->") or (operator == "->" and not receiver.variable.isPointer):
+                return candidates
+            parts = []
+            token = receiver.variable.typeStartToken
+            while token:
+                if token.str in ("<", "*", "&", "["):
+                    break
+                if token.str not in ("const", "volatile", "class", "struct"):
+                    parts.append(token.str)
+                if token is receiver.variable.typeEndToken:
+                    break
+                token = token.next
+            receiver_type = "".join(parts)
+        else:
+            return candidates
+        if not receiver_type:
+            return candidates
+        resolved = qualified_function_name(callee.function) if callee.function else None
+        def owner_of(candidate):
+            scope = candidate.function.tokenDef.scope if candidate.function.tokenDef else None
+            while scope and scope.type not in ("Class", "Struct"):
+                scope = scope.nestedIn
+            return ("::".join(enclosing_named_scope(scope)) if scope else
+                    candidate.name.rpartition("::")[0])
+
+        def matches_receiver(owner):
+            return bool(owner and (owner == receiver_type or
+                        ("::" not in owner or "::" not in receiver_type) and
+                        owner.rsplit("::", 1)[-1] == receiver_type.rsplit("::", 1)[-1]))
+
+        def is_virtual(function):
+            if not function:
+                return False
+            if function.isVirtual or function.isImplicitlyVirtual:
+                return True
+            token = function.tokenDef.previous if function.tokenDef else None
+            while token and token.str not in (";", "{", "}"):
+                if token.str == "virtual":
+                    return True
+                token = token.previous
+            return False
+
+        virtual_dispatch = is_virtual(callee.function)
+        virtual_dispatch = virtual_dispatch or any(
+            matches_receiver(owner_of(candidate)) and
+            is_virtual(candidate.function)
+            for candidate in candidates
+        )
+        compatible = []
+        for candidate in candidates:
+            if (candidate.name == resolved or
+                    (virtual_dispatch and is_virtual(candidate.function))):
+                compatible.append(candidate)
+                continue
+            if matches_receiver(owner_of(candidate)):
+                compatible.append(candidate)
+        return compatible
+
     def _call_candidates(self, model, token, state=None):
         callee = self._callee_token(token)
         if not callee:
@@ -1187,7 +1326,9 @@ class LocksetAnalyzer(object):
                     if target in self.by_identity]
         # Keep same-name alternatives even when Cppcheck resolved one concrete
         # declaration.  This preserves conservative virtual/ambiguous targets.
-        return self._function_models_for_symbol(callee)
+        return self._member_call_candidates(
+            model, callee, self._function_models_for_symbol(callee)
+        )
 
     def _sorted_accesses(self):
         result = []

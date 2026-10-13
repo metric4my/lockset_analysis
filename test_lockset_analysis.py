@@ -125,6 +125,61 @@ void scoped_release() {
         self.assertFalse(any(a["variable"] == "local" for a in accesses))
         self.assertTrue(all(Path(a["location"]["file"]).suffix in {".cpp", ".cc", ".hpp"} for a in accesses))
 
+    def test_reference_argument_binding_is_not_a_read(self):
+        self.write("reference_argument.cpp", """
+int shared_counter = 0;
+void modify(int & value) { value = 100; }
+void by_value(int value) { (void)value; }
+int main() {
+  modify(shared_counter);
+  by_value(shared_counter);
+}
+""")
+        rows = [row for row in self.analyze() if row["variable"] == "shared_counter"]
+        self.assertTrue(any(row["function"] == "modify" and
+                            row["access_kind"] == "WRITE" for row in rows))
+        self.assertFalse(any(row["function"] == "main" and
+                             row["location"]["line"] == 6 for row in rows))
+        self.assertTrue(any(row["function"] == "main" and
+                            row["location"]["line"] == 7 and
+                            row["access_kind"] == "READ" for row in rows))
+
+    def test_external_receiver_reset_does_not_call_enclosing_class_reset(self):
+        self.write("receiver_reset.cpp", """
+#include <mutex>
+struct Handle { void reset(); };
+struct Base { virtual void reset() = 0; };
+struct Checker : Base {
+  std::mutex mutex_;
+  Handle handler_;
+  int data_;
+  void reset() override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    handler_.reset();
+  }
+  void cleanup() { handler_.reset(); data_ = 1; }
+};
+int main() { Checker checker; checker.cleanup(); }
+""")
+        row = next(row for row in self.analyze() if row["function"] == "Checker::cleanup"
+                   and row["variable"] == "Checker::data_")
+        self.assertEqual([], row["may_locks"])
+
+    def test_explicit_this_member_call_still_propagates_lock(self):
+        self.write("this_call.cpp", """
+#include <mutex>
+std::mutex mutex_;
+int data_;
+struct Checker {
+  void reset() { data_++; }
+  void invoke() { std::lock_guard<std::mutex> guard(mutex_); this->reset(); }
+};
+int main() { Checker checker; checker.invoke(); }
+""")
+        row = next(row for row in self.analyze() if row["function"] == "Checker::reset"
+                   and row["variable"] == "data_")
+        self.assertEqual(["mutex_"], row["must_locks"])
+
     def test_all_supported_raii_and_shared_lock_operations(self):
         self.write(
             "locks.cpp",
@@ -205,6 +260,8 @@ int main() { caller(); }
         self.assertFalse(any(access["location"]["line"] == 8 for access in accesses))
 
     def test_roscallbax_cli_lockset_mode_has_no_callback_checker_dependency(self):
+        if not (SRC / "roscbexec.py").is_file():
+            self.skipTest("optional ROSCallBaX CLI is not included in standalone release")
         self.write("main.cpp", "int shared; int main() { shared = 1; }\n")
         output = self.project / "result.json"
         command = [
@@ -245,7 +302,7 @@ void release(std::mutex & lock) { lock.unlock(); }
 void parameter_locking() { acquire(mutex_); data_ = 4; release(mutex_); other_ = 5; }
 int unlock_and_return() { mutex_.unlock(); return 7; }
 void rhs_call_order() { mutex_.lock(); data_ = unlock_and_return(); }
-void lock_after_argument_read(int &) { mutex_.lock(); }
+void lock_after_argument_read(int) { mutex_.lock(); }
 void argument_order() { lock_after_argument_read(data_); mutex_.unlock(); }
 struct Base { virtual void go() {} };
 struct Derived : Base { void go() override { mutex_.lock(); } };
@@ -372,6 +429,33 @@ int main() { direct(); }
         access = next(a for a in accesses if a["variable"] == "data_")
         self.assertEqual(["mutex_"], access["must_locks"])
 
+    def test_lambda_passed_to_unresolved_call_has_unknown_lock_context(self):
+        self.write("opaque_callback.cpp", """
+#include <condition_variable>
+#include <mutex>
+struct Worker {
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool ready_ = false;
+  void run() {
+    std::unique_lock<std::mutex> guard(mutex_);
+    condition_.wait(guard, [this]() { return ready_; });
+    ready_ = false;
+  }
+};
+int main() { Worker worker; worker.run(); }
+""")
+        rows = self.analyze()
+        read = next(a for a in rows if a["variable"] == "Worker::ready_"
+                    and a["access_kind"] == "READ")
+        write = next(a for a in rows if a["variable"] == "Worker::ready_"
+                     and a["access_kind"] == "WRITE" and a["location"]["line"] == 11)
+        self.assertEqual(["Worker::mutex_"], read["may_locks"])
+        self.assertEqual([], read["must_locks"])
+        self.assertTrue(read["lock_context_unknown"])
+        self.assertEqual(["Worker::mutex_"], write["must_locks"])
+        self.assertNotIn("lock_context_unknown", write)
+
     def test_loop_break_and_continue_stop_following_statements(self):
         self.write("jumps.cpp", """
 #include <mutex>
@@ -401,6 +485,8 @@ int main() { via_break(false); via_continue(false); }
         from lockset_analysis import LocksetAnalyzer
 
         project = Path(__file__).resolve().parents[2] / "case" / "deadlock-master"
+        if not project.is_dir():
+            self.skipTest("optional deadlock-master fixture is not available")
         accesses = LocksetAnalyzer(str(project)).run()["accesses"]
         header = [a for a in accesses if a["location"]["file"] == "src/simple_action_server.hpp"]
 
@@ -485,6 +571,54 @@ int main() { State state(1); }
         self.assertEqual("WRITE", rows[0]["access_kind"])
         self.assertEqual(4, rows[0]["location"]["line"])
 
+    def test_destructor_name_retains_tilde(self):
+        self.write("destructor.cpp", """
+struct State {
+  int value_;
+  ~State();
+  void touch();
+};
+State::~State() { value_++; }
+void State::touch() { value_++; }
+int main() { State state; state.touch(); }
+""")
+        names = {row["function"] for row in self.analyze()
+                 if row["variable"] == "State::value_"}
+        self.assertEqual({"State::~State", "State::touch"}, names)
+
+    def test_member_function_does_not_analyze_previous_function_as_initializer(self):
+        self.write("checker.hpp", """
+#pragma once
+#include <mutex>
+#include <vector>
+struct Checker {
+  int logger_;
+  int data_;
+  std::mutex mutex_;
+  void validate(const std::vector<int> & values);
+  void update(const std::vector<int> & values);
+};
+""")
+        self.write("checker.cpp", """
+#include "checker.hpp"
+void Checker::validate(const std::vector<int> & values) {
+  for (const auto & value : values) {
+    if (value < 0) { logger_++; }
+  }
+}
+void Checker::update(const std::vector<int> & values) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  data_++;
+}
+int main() { Checker checker; checker.validate({1}); checker.update({1}); }
+""")
+        accesses = self.analyze()
+        logger = [row for row in accesses if row["variable"] == "Checker::logger_"]
+        self.assertEqual(["Checker::validate"], [row["function"] for row in logger])
+        data = [row for row in accesses if row["variable"] == "Checker::data_"]
+        self.assertEqual(["Checker::update"], [row["function"] for row in data])
+        self.assertEqual(["Checker::mutex_"], data[0]["must_locks"])
+
     def test_reference_capture_escaping_through_callback_argument(self):
         self.write("capture.cpp", """
 void register_callback(void (*callback)());
@@ -507,6 +641,8 @@ int main() {
         from lockset_analysis import LocksetAnalyzer
 
         project = Path(__file__).resolve().parents[2] / "case" / "deadlock-master"
+        if not project.is_dir():
+            self.skipTest("optional deadlock-master fixture is not available")
         accesses = LocksetAnalyzer(str(project)).run()["accesses"]
         rows = [a for a in accesses if a["location"]["file"] == "src/deadlock.cpp"]
         self.assertTrue(any(a["variable"] == "goal_result_available"
